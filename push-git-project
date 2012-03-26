@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 # encoding: utf-8
+# Based on push-git-project script at https://github.com/matthewfallshaw/utilities
 %w[rubygems optparse ostruct inifile pp].each {|l| require l }
 
 default_repository = nil
