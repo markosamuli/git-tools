@@ -1,0 +1,165 @@
+#!/usr/bin/env ruby
+# encoding: utf-8
+%w[rubygems optparse ostruct inifile pp].each {|l| require l }
+
+default_repository = nil
+REPO = {}
+
+projects = File.join(ENV['HOME'], ".git-projects")
+if File.file?(projects)
+  project_inifile = IniFile.new(projects)
+  project_inifile.each_section do |section|
+    if section == "push-git-project"
+      if section.include?("default")
+        default_repository = section["default"]
+      end
+    else
+      REPO[section] = {}
+      %w(host gitosis group).each do |k|
+        abort "#{k} missing in section #{section} when parsing #{projects}" unless project_inifile[section].include?(k)
+        REPO[section][k.intern] = project_inifile[section][k]
+      end
+    end
+  end
+  if default_repository.nil? and REPO.size == 1
+    default_repository = REPO.keys[0]
+  end
+else
+  puts "Config file #{projects} not found!"
+  exit
+end
+
+abort "Run this script in a git project" unless File.directory?(".git")
+
+options = OpenStruct.new
+def options.gitosis_conf=(file)
+  if File.file?(file)
+    super file
+  elsif File.file?(File.join(file, "gitosis.conf"))
+    super File.join(file, "gitosis.conf")
+  else
+    abort "I'm looking for a gitosis.conf in there (#{file})... and I can't find it."
+  end
+end
+
+def exec cmd
+  puts cmd
+  system cmd or abort
+end
+
+head = `git symbolic-ref HEAD`.chomp.gsub(/refs\/heads\//, "")
+
+# Defaults
+options.branch = head.empty? ? head.gsub(/refs\/heads\//, "") : "master"
+options.remote = "origin"
+options.hostname      = REPO[default_repository][:host]
+options.gitosis_conf  = REPO[default_repository][:gitosis]
+options.gitosis_group = REPO[default_repository][:group]
+
+# Parsing command line options
+opts = OptionParser.new do |o|
+  o.on('-t', '--target [REPOSITORY]',
+       "add project to repository",
+       "DEFAULT: #{default_repository}") do |repository|
+    abort "repository #{repository} config not found" unless REPO.include?(repository)
+    options.hostname      = REPO[repository][:host]
+    options.gitosis_conf  = REPO[repository][:gitosis]
+    options.gitosis_group = REPO[repository][:group]
+  end
+  o.on('--host [HOSTNAME]',
+       "host to push project to",
+       "DEFAULT: #{options.hostname}") do |hostname|
+    options.hostname = hostname
+  end
+  o.on('-c', '--gitosis-conf [CONFIG FILE]',
+       "gitosis project to push project to",
+       "DEFAULT: #{options.gitosis_conf}") do |conf_file|
+    options.gitosis_conf = conf_file
+  end
+  o.on('-g', '--gitosis-group [GROUP]',
+       "gitosis group to add project to",
+       "DEFAULT: #{options.gitosis_group}") do |group|
+    options.gitosis_group = group
+  end
+  o.on('-b', '--branch [BRANCH]', 
+    "git branch to add", 
+    "DEFAULT: #{options.branch}") do |branch|
+    options.branch = branch
+  end
+  o.on('-r', '--remote [REMOTE]', 
+    "git remote to add",
+    "DEFAULT: #{options.remote}") do |remote|
+    options.remote = remote
+  end
+  o.on('-l', '--list', 'list known repositories') do
+    puts "Known repositories:"
+    REPO.each do |key,repo|
+      puts "- #{key}#{default_repository == key ? ' (default)' : ''}"
+    end
+    exit
+  end
+  o.on('--list-groups [REPOSITORY]',
+    "list groups in repository") do |repository|
+    abort "repository #{repository} config not found" unless REPO.include?(repository)
+    config = REPO[repository][:gitosis]
+    system "cd #{File.dirname(config)} && git pull -q origin master" or abort
+    puts "Groups in #{config}"
+    inifile = IniFile.new(config)
+    inifile.each_section do |section,options|
+      m = /^group (.+)/.match(section)
+      puts "- #{m[1]}" unless m.nil?
+    end
+    exit
+  end
+  o.on('-h', '--help', "this help text") { puts o; exit }
+  o.parse!
+end
+
+abort "Failed to fetch git branch name, is this really a git project?" if head.empty?
+
+if ARGV.size == 1
+  options.project = "#{options.projectfiles}#{ARGV.pop}"
+elsif ARGV.empty?
+  options.project = "#{options.projectfiles}#{`basename \`pwd\``}".chomp
+else
+  abort "Unexpected arguments.\n#{opts}"
+end
+
+# Check project
+local_ref = `git show-ref heads/#{options.branch}`
+remote_ref = `git show-ref remotes/#{options.remote}/#{options.branch}`
+remote_config = `git config branch.#{options.branch}.merge`
+abort "No local branch #{options.branch} exists!" if local_ref.empty?
+abort "Project #{options.project} already has a remote '#{options.remote}'" if `git remote`.split.include?(options.remote)
+abort "A remote branch #{options.branch} on #{options.remote} already exists!" unless remote_ref.empty?
+abort "Local branch #{options.branch} is already a tracking branch!" unless remote_config.empty?
+
+# Pull gitosis-admin project
+system "cd #{File.dirname(options.gitosis_conf)} && git pull -q origin master" or abort
+inifile = IniFile.new(options.gitosis_conf)
+
+gitosis_section = "group #{options.gitosis_group}"
+
+# Sanity checks in gitosis-admin
+abort "I can't find section '#{gitosis_section}' and line 'writable = …' in #{options.gitosis_conf}" unless ( inifile[gitosis_section] && inifile[gitosis_section]['writable'] )
+writable = inifile[gitosis_section]['writable'].dup.split(/ /)
+abort "gitosis already knows #{options.project} is writable by #{options.gitosis_group}" if writable.include?(options.project)
+
+# Add project to the writable list in gitosis-admin
+writable << options.project
+gitosis_admin = writable.delete("gitosis-admin")
+inifile[gitosis_section]['writable'] = "#{gitosis_admin ? 'gitosis-admin ' : ''}#{writable.sort.join(" ")}"
+inifile.save
+
+# Commit gitosis-admin changes to the repository
+exec "cd #{File.dirname(options.gitosis_conf)} && git add gitosis.conf && git commit -m 'add project #{options.project} as writable by #{options.gitosis_group}' && git push origin master"
+exec "git remote add #{remote} git@#{options.hostname}:#{options.project}.git"
+
+# Push branch to remote and track the remote branch
+exec "git push #{options.remote} #{options.branch}:refs/heads/#{options.branch}"
+exec "git config branch.#{options.branch}.remote #{options.remote}"
+exec "git config branch.#{options.branch}.merge refs/heads/#{options.branch}"
+
+puts
+puts "Project #{options.project} branch #{options.branch} pushed to:"
+puts `git remote show #{options.remote}`
